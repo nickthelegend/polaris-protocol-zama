@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 pragma solidity ^0.8.24;
 
-import { FHE, euint128, externalEuint128, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
 import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
 
 /**
@@ -10,17 +10,23 @@ import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
  */
 contract PrivateLendingPool is ZamaEthereumConfig {
     // Mapping of user to their supplied amount (encrypted)
-    mapping(address => euint128) private suppliedAmounts;
-    
+    mapping(address => euint64) private suppliedAmounts;
+
     // Total liquidity in the pool (encrypted)
-    euint128 private totalLiquidity;
+    euint64 private totalLiquidity;
+
+    address public borrowManager;
 
     event Supplied(address indexed user);
     event Withdrawn(address indexed user);
 
     constructor() {
-        totalLiquidity = FHE.asEuint128(0);
+        totalLiquidity = FHE.asEuint64(0);
         FHE.allowThis(totalLiquidity);
+    }
+
+    function setBorrowManager(address _borrow) external {
+        borrowManager = _borrow;
     }
 
     /**
@@ -28,9 +34,9 @@ contract PrivateLendingPool is ZamaEthereumConfig {
      * @param encryptedAmount The encrypted amount handle
      * @param inputProof Proof of encryption
      */
-    function supply(externalEuint128 encryptedAmount, bytes calldata inputProof) external {
-        euint128 amount = FHE.fromExternal(encryptedAmount, inputProof);
-        
+    function supply(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
+        euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
+
         if (FHE.isInitialized(suppliedAmounts[msg.sender])) {
             suppliedAmounts[msg.sender] = FHE.add(suppliedAmounts[msg.sender], amount);
         } else {
@@ -52,15 +58,14 @@ contract PrivateLendingPool is ZamaEthereumConfig {
      * @param encryptedAmount The encrypted amount handle
      * @param inputProof Proof of encryption
      */
-    function withdraw(externalEuint128 encryptedAmount, bytes calldata inputProof) external {
-        euint128 amount = FHE.fromExternal(encryptedAmount, inputProof);
-        euint128 currentBalance = suppliedAmounts[msg.sender];
-        
+    function withdraw(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
+        euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
+        euint64 currentBalance = suppliedAmounts[msg.sender];
+
         ebool hasBalance = FHE.le(amount, currentBalance);
-        
-        // Only subtract if they have enough balance (branchless)
-        euint128 amountToSubtract = FHE.select(hasBalance, amount, FHE.asEuint128(0));
-        
+
+        euint64 amountToSubtract = FHE.select(hasBalance, amount, currentBalance);
+
         suppliedAmounts[msg.sender] = FHE.sub(currentBalance, amountToSubtract);
         totalLiquidity = FHE.sub(totalLiquidity, amountToSubtract);
 
@@ -73,16 +78,17 @@ contract PrivateLendingPool is ZamaEthereumConfig {
     }
 
     /**
-     * @notice Get encrypted supplied amount of the caller
+     * @notice Get encrypted supplied amount of the user
+     * @param user The user address
      */
-    function getSuppliedAmount() external view returns (euint128) {
-        return suppliedAmounts[msg.sender];
+    function getSuppliedAmount(address user) external view returns (euint64) {
+        return suppliedAmounts[user];
     }
-    
+
     /**
      * @notice Get total liquidity (only accessible by protocol for now)
      */
-    function getTotalLiquidity() external view returns (euint128) {
+    function getTotalLiquidity() external view returns (euint64) {
         return totalLiquidity;
     }
 }

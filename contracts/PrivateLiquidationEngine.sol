@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 pragma solidity ^0.8.24;
 
-import { FHE, euint128, externalEuint128, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { FHE, euint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
 import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
 import { PrivateCollateralVault } from "./PrivateCollateralVault.sol";
 import { PrivateBorrowManager } from "./PrivateBorrowManager.sol";
@@ -13,9 +13,12 @@ import { PrivateBorrowManager } from "./PrivateBorrowManager.sol";
 contract PrivateLiquidationEngine is ZamaEthereumConfig {
     PrivateCollateralVault public collateralVault;
     PrivateBorrowManager public borrowManager;
-    
+
     // Liquidation threshold (lower than borrow ratio, e.g. 1.25x)
-    uint128 constant LIQUIDATION_THRESHOLD = 125;
+    uint64 constant LIQUIDATION_THRESHOLD = 125;
+
+    // Store the pending health check handle per user
+    mapping(address => ebool) private pendingHealthChecks;
 
     // Track if a user is currently under liquidation (revealed)
     mapping(address => bool) public isLiquidatable;
@@ -28,47 +31,64 @@ contract PrivateLiquidationEngine is ZamaEthereumConfig {
         borrowManager = PrivateBorrowManager(_borrowManager);
     }
 
+    function setBorrowManager(address _borrow) external {
+        borrowManager = PrivateBorrowManager(_borrow);
+    }
+
+    function setCollateralVault(address _vault) external {
+        collateralVault = PrivateCollateralVault(_vault);
+    }
+
     /**
-     * @notice Check health factor and reveal if liquidatable
+     * @notice Get the pending health check handle for a user (for testing/resolving)
+     * @param user The user address
+     */
+    function getPendingHealthCheck(address user) external view returns (ebool) {
+        return pendingHealthChecks[user];
+    }
+
+    /**
+     * @notice Check health factor and request public decryption
      * @param user The user address to audit
      */
     function auditHealth(address user) external {
-        euint128 collateral = collateralVault.getCollateralAmount(user);
-        euint128 debt = borrowManager.getDebtAmount(user);
-        
+        euint64 collateral = collateralVault.getCollateralAmount(user);
+        euint64 debt = borrowManager.getDebtAmount(user);
+
         // Under threshold: collateral * 100 < debt * LIQUIDATION_THRESHOLD
-        euint128 weightedCollateral = FHE.mul(collateral, FHE.asEuint128(100));
-        euint128 thresholdCollateral = FHE.mul(debt, FHE.asEuint128(LIQUIDATION_THRESHOLD));
-        
+        euint64 weightedCollateral = FHE.mul(collateral, FHE.asEuint64(100));
+        euint64 thresholdCollateral = FHE.mul(debt, FHE.asEuint64(LIQUIDATION_THRESHOLD));
+
         ebool isUnhealthy = FHE.lt(weightedCollateral, thresholdCollateral);
-        
-        // This is where public decryption comes in.
-        // We make the `isUnhealthy` flag publicly decryptable so the off-chain relayer can confirm it.
+
+        pendingHealthChecks[user] = isUnhealthy;
+        FHE.allowThis(isUnhealthy);
         FHE.makePubliclyDecryptable(isUnhealthy);
-        
-        // Mark the user as having a pending health check (off-chain handles result)
+
         emit LiquidationStarted(user);
     }
 
     /**
-     * @notice Perform liquidation with a decryption proof of the `isUnhealthy` flag
+     * @notice Resolve audit with KMS decryption proof
      * @param user The user address to liquidate
-     * @param isUnhealthyResult The decrypted boolean result
-     * @param proof The decryption proof
+     * @param abiEncodedClearResult ABI-encoded decrypted bool
+     * @param decryptionProof KMS decryption proof
      */
-    function liquidate(address user, bool isUnhealthyResult, bytes calldata proof) external {
-        // 1. Verify that isUnhealthyResult was indeed the output of auditHealth(user)
-        // Note: For simplicity, we assume handles are tracked by the UI/off-chain correctly.
-        // In a full implementation, you'd store the handle and verify it here.
-        
-        require(isUnhealthyResult == true, "User is healthy");
-        
-        // Actually liquidate (e.g., zero out debt, seize collateral)
-        // Simplified: Clear user's position
-        // BorrowManager and CollateralVault would need to allow this engine.
-        
+    function resolveAudit(
+        address user,
+        bytes memory abiEncodedClearResult,
+        bytes memory decryptionProof
+    ) external {
+        bytes32[] memory handles = new bytes32[](1);
+        handles[0] = ebool.unwrap(pendingHealthChecks[user]);
+        FHE.checkSignatures(handles, abiEncodedClearResult, decryptionProof);
+
+        bool isUnhealthy = abi.decode(abiEncodedClearResult, (bool));
+        require(isUnhealthy, "User is healthy, cannot liquidate");
+
         isLiquidatable[user] = true;
-        
+        pendingHealthChecks[user] = ebool.wrap(0);
+
         emit Liquidated(user, msg.sender);
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 pragma solidity ^0.8.24;
 
-import { FHE, euint128, externalEuint128, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
 import { ZamaEthereumConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
 import { PrivateCollateralVault } from "./PrivateCollateralVault.sol";
 
@@ -11,12 +11,17 @@ import { PrivateCollateralVault } from "./PrivateCollateralVault.sol";
  */
 contract PrivateBorrowManager is ZamaEthereumConfig {
     PrivateCollateralVault public collateralVault;
-    
+    address public lendingPool;
+
     // Mapping of user to their debt amount (encrypted)
-    mapping(address => euint128) private debtAmounts;
-    
+    mapping(address => euint64) private debtAmounts;
+
+    // Authorization for other protocol contracts (e.g. LiquidationEngine)
+    mapping(address => bool) private authorizedManagers;
+    address[] private authorizedManagerList;
+
     // Config: Fixed collateral requirement ratio of 1.5x (150%)
-    uint128 constant COLLATERAL_RATIO = 150;
+    uint64 constant COLLATERAL_RATIO = 150;
 
     event Borrowed(address indexed user);
     event Repaid(address indexed user);
@@ -25,32 +30,61 @@ contract PrivateBorrowManager is ZamaEthereumConfig {
         collateralVault = PrivateCollateralVault(_collateralVault);
     }
 
+    function setLendingPool(address _lendingPool) external {
+        lendingPool = _lendingPool;
+    }
+
+    function setCollateralVault(address _vault) external {
+        collateralVault = PrivateCollateralVault(_vault);
+    }
+
+    /**
+     * @notice Authorize a contract to use encrypted debt handles in FHE operations
+     * @param contractAddress The contract to authorize
+     */
+    function authorizeContract(address contractAddress) external {
+        if (!authorizedManagers[contractAddress]) {
+            authorizedManagers[contractAddress] = true;
+            authorizedManagerList.push(contractAddress);
+        }
+    }
+
+    /**
+     * @dev Grant FHE access to all authorized managers for a given handle
+     */
+    function _grantAuthorizedAccess(euint64 handle) internal {
+        for (uint256 i = 0; i < authorizedManagerList.length; i++) {
+            FHE.allow(handle, authorizedManagerList[i]);
+        }
+    }
+
     /**
      * @notice Borrow tokens privately
      * @param encryptedAmount The encrypted amount handle
      * @param inputProof Proof of encryption
      */
-    function borrow(externalEuint128 encryptedAmount, bytes calldata inputProof) external {
-        euint128 amountToBorrow = FHE.fromExternal(encryptedAmount, inputProof);
-        euint128 currentDebt = debtAmounts[msg.sender];
-        euint128 collateral = collateralVault.getCollateralAmount(msg.sender);
-        
+    function borrow(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
+        euint64 amountToBorrow = FHE.fromExternal(encryptedAmount, inputProof);
+        euint64 currentDebt = debtAmounts[msg.sender];
+        euint64 collateral = collateralVault.getCollateralAmount(msg.sender);
+
         // Calculate new debt
-        euint128 newDebt = FHE.add(currentDebt, amountToBorrow);
-        
+        euint64 newDebt = FHE.add(currentDebt, amountToBorrow);
+
         // Check health factor: collateral >= newDebt * 1.5
         // -> collateral * 100 >= newDebt * 150
-        euint128 weightedCollateral = FHE.mul(collateral, FHE.asEuint128(100));
-        euint128 requiredCollateral = FHE.mul(newDebt, FHE.asEuint128(COLLATERAL_RATIO));
-        
+        euint64 weightedCollateral = FHE.mul(collateral, FHE.asEuint64(100));
+        euint64 requiredCollateral = FHE.mul(newDebt, FHE.asEuint64(COLLATERAL_RATIO));
+
         ebool isHealthy = FHE.ge(weightedCollateral, requiredCollateral);
-        
+
         // Only update debt if it's healthy (branchless)
         debtAmounts[msg.sender] = FHE.select(isHealthy, newDebt, currentDebt);
 
         // Access control
         FHE.allowThis(debtAmounts[msg.sender]);
         FHE.allow(debtAmounts[msg.sender], msg.sender);
+        _grantAuthorizedAccess(debtAmounts[msg.sender]);
 
         emit Borrowed(msg.sender);
     }
@@ -60,21 +94,20 @@ contract PrivateBorrowManager is ZamaEthereumConfig {
      * @param encryptedAmount The encrypted amount handle
      * @param inputProof Proof of encryption
      */
-    function repay(externalEuint128 encryptedAmount, bytes calldata inputProof) external {
-        euint128 amountToRepay = FHE.fromExternal(encryptedAmount, inputProof);
-        euint128 currentDebt = debtAmounts[msg.sender];
-        
+    function repay(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
+        euint64 amountToRepay = FHE.fromExternal(encryptedAmount, inputProof);
+        euint64 currentDebt = debtAmounts[msg.sender];
+
         ebool hasDebt = FHE.le(amountToRepay, currentDebt);
-        
-        // amountToSubtract = hasDebt ? amountToRepay : currentDebt (for full repayment if they overpay?)
-        // Or just allow them to repay whatever, and cap at currentDebt.
-        euint128 amountToSubtract = FHE.select(hasDebt, amountToRepay, currentDebt);
-        
+
+        euint64 amountToSubtract = FHE.select(hasDebt, amountToRepay, currentDebt);
+
         debtAmounts[msg.sender] = FHE.sub(currentDebt, amountToSubtract);
 
         // Access control
         FHE.allowThis(debtAmounts[msg.sender]);
         FHE.allow(debtAmounts[msg.sender], msg.sender);
+        _grantAuthorizedAccess(debtAmounts[msg.sender]);
 
         emit Repaid(msg.sender);
     }
@@ -83,7 +116,7 @@ contract PrivateBorrowManager is ZamaEthereumConfig {
      * @notice Get encrypted debt amount of the user
      * @param user The user address
      */
-    function getDebtAmount(address user) external view returns (euint128) {
+    function getDebtAmount(address user) external view returns (euint64) {
         return debtAmounts[user];
     }
 }

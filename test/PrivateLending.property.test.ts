@@ -5,10 +5,48 @@ import { ethers } from "ethers";
 import * as fc from "fast-check";
 import hre from "hardhat";
 
+// Typed contract helpers — avoids TypeChain generation requirement
+type CollateralVault = {
+  getAddress(): Promise<string>;
+  waitForDeployment(): Promise<void>;
+  connect(signer: any): CollateralVault;
+  authorizeContract(addr: string): Promise<any>;
+  depositCollateral(handle: any, proof: any): Promise<any>;
+  withdrawCollateral(handle: any, proof: any): Promise<any>;
+  getCollateralAmount(user: string): Promise<any>;
+};
+
+type BorrowManager = {
+  getAddress(): Promise<string>;
+  waitForDeployment(): Promise<void>;
+  connect(signer: any): BorrowManager;
+  authorizeContract(addr: string): Promise<any>;
+  borrow(handle: any, proof: any): Promise<any>;
+  repay(handle: any, proof: any): Promise<any>;
+  getDebtAmount(user: string): Promise<any>;
+};
+
+type LiquidationEngine = {
+  getAddress(): Promise<string>;
+  waitForDeployment(): Promise<void>;
+  connect(signer: any): LiquidationEngine;
+  auditHealth(user: string): Promise<any>;
+  resolveAudit(user: string, abiEncoded: any, proof: any): Promise<any>;
+  getPendingHealthCheck(user: string): Promise<any>;
+  isLiquidatable(user: string): Promise<boolean>;
+};
+
+type LendingPool = {
+  getAddress(): Promise<string>;
+  waitForDeployment(): Promise<void>;
+  connect(signer: any): LendingPool;
+  supply(handle: any, proof: any): Promise<any>;
+  getSuppliedAmount(user: string): Promise<any>;
+};
+
 // Feature: fhe-private-lending, Property 1: Collateral deposit round-trip
 
 describe("FHE Private Lending - Property Tests", function () {
-  // Increase timeout for FHE operations
   this.timeout(300_000);
 
   before(async function () {
@@ -19,14 +57,11 @@ describe("FHE Private Lending - Property Tests", function () {
 
   /**
    * Property 1: Collateral Deposit Round-Trip
-   *
-   * For any valid uint64 amount, depositing that amount into PrivateCollateralVault
-   * and then performing a user-decryption of the collateral handle should return
-   * the deposited amount.
-   *
+   * For any valid uint64 amount, depositing then decrypting returns the same amount.
+   * Feature: fhe-private-lending, Property 1: Collateral deposit round-trip
    * Validates: Requirements 2.1, 2.3, 8.3
    */
-  it("Property 1: Collateral deposit round-trip - for any uint64 amount, deposit then decrypt returns the same amount", async function () {
+  it("Property 1: Collateral deposit round-trip", async function () {
     const signers = await hre.ethers.getSigners();
 
     await fc.assert(
@@ -36,7 +71,7 @@ describe("FHE Private Lending - Property Tests", function () {
           const user = signers[1];
 
           const FreshVaultFactory = await hre.ethers.getContractFactory("PrivateCollateralVault");
-          const freshVault = await FreshVaultFactory.connect(user).deploy();
+          const freshVault = (await FreshVaultFactory.connect(user).deploy()) as unknown as CollateralVault;
           await freshVault.waitForDeployment();
           const freshVaultAddress = await freshVault.getAddress();
 
@@ -58,23 +93,62 @@ describe("FHE Private Lending - Property Tests", function () {
   });
 
   /**
-   * Property 2: Borrow Round-Trip
-   *
-   * For any valid collateral C and borrow B where C * 100 >= B * 150 (healthy),
-   * depositing C as collateral and borrowing B should result in a user-decryption
-   * of the debt handle returning B.
-   *
-   * Feature: fhe-private-lending, Property 2: Borrow round-trip
-   * Validates: Requirements 3.1, 3.5, 8.4
+   * Property 7: Withdrawal Cap
+   * For any deposit D and withdrawal W > D, after withdrawing, balance = 0 (no underflow).
+   * Feature: fhe-private-lending, Property 7: Withdrawal cap
+   * Validates: Requirements 2.2, 2.5
    */
-  it("Property 2: Borrow round-trip - for any healthy (collateral, borrow) pair, borrow then decrypt returns borrow amount", async function () {
+  it("Property 7: Withdrawal cap - over-withdrawal zeroes the balance without underflow", async function () {
     const signers = await hre.ethers.getSigners();
 
     await fc.assert(
       fc.asyncProperty(
-        // Generate borrow amount B in [1, 1000], then collateral C = ceil(B * 150 / 100) to guarantee health
+        fc.bigInt({ min: 1n, max: 1_000_000n }).chain((deposit) =>
+          fc.tuple(
+            fc.constant(deposit),
+            fc.bigInt({ min: deposit + 1n, max: deposit + 1_000_000n }),
+          )
+        ),
+        async ([deposit, withdrawal]) => {
+          const user = signers[8];
+
+          const VaultFactory = await hre.ethers.getContractFactory("PrivateCollateralVault");
+          const vault = (await VaultFactory.connect(user).deploy()) as unknown as CollateralVault;
+          await vault.waitForDeployment();
+          const vaultAddress = await vault.getAddress();
+
+          const depositInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
+          depositInput.add64(deposit);
+          const encDeposit = await depositInput.encrypt();
+          await (await vault.connect(user).depositCollateral(encDeposit.handles[0], encDeposit.inputProof)).wait();
+
+          const withdrawInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
+          withdrawInput.add64(withdrawal);
+          const encWithdraw = await withdrawInput.encrypt();
+          await (await vault.connect(user).withdrawCollateral(encWithdraw.handles[0], encWithdraw.inputProof)).wait();
+
+          const handle = await vault.getCollateralAmount(user.address);
+          const decrypted = await hre.fhevm.userDecryptEuint(FhevmType.euint64, handle, vaultAddress, user);
+          expect(decrypted).to.equal(0n);
+        },
+      ),
+      { numRuns: 10, verbose: true },
+    );
+  });
+
+  /**
+   * Property 2: Borrow Round-Trip
+   * For any healthy (collateral, borrow) pair, borrow then decrypt returns borrow amount.
+   * Feature: fhe-private-lending, Property 2: Borrow round-trip
+   * Validates: Requirements 3.1, 3.5, 8.4
+   */
+  it("Property 2: Borrow round-trip", async function () {
+    const signers = await hre.ethers.getSigners();
+
+    await fc.assert(
+      fc.asyncProperty(
         fc.bigInt({ min: 1n, max: 1_000n }).chain((borrow) => {
-          const minCollateral = (borrow * 150n + 99n) / 100n; // ceil(borrow * 1.5)
+          const minCollateral = (borrow * 150n + 99n) / 100n;
           return fc.tuple(
             fc.bigInt({ min: minCollateral, max: minCollateral + 10_000n }),
             fc.constant(borrow),
@@ -83,35 +157,28 @@ describe("FHE Private Lending - Property Tests", function () {
         async ([collateral, borrow]) => {
           const user = signers[2];
 
-          // Deploy fresh vault and borrow manager
           const VaultFactory = await hre.ethers.getContractFactory("PrivateCollateralVault");
-          const vault = await VaultFactory.connect(user).deploy();
+          const vault = (await VaultFactory.connect(user).deploy()) as unknown as CollateralVault;
           await vault.waitForDeployment();
           const vaultAddress = await vault.getAddress();
 
           const BorrowFactory = await hre.ethers.getContractFactory("PrivateBorrowManager");
-          const borrowManager = await BorrowFactory.connect(user).deploy(vaultAddress);
+          const borrowManager = (await BorrowFactory.connect(user).deploy(vaultAddress)) as unknown as BorrowManager;
           await borrowManager.waitForDeployment();
           const borrowAddress = await borrowManager.getAddress();
 
-          // Authorize borrow manager to use collateral handles in FHE ops
           await (await vault.connect(user).authorizeContract(borrowAddress)).wait();
 
-          // Deposit collateral
           const collateralInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
           collateralInput.add64(collateral);
           const encCollateral = await collateralInput.encrypt();
-          const depositTx = await vault.connect(user).depositCollateral(encCollateral.handles[0], encCollateral.inputProof);
-          await depositTx.wait();
+          await (await vault.connect(user).depositCollateral(encCollateral.handles[0], encCollateral.inputProof)).wait();
 
-          // Borrow
           const borrowInput = hre.fhevm.createEncryptedInput(borrowAddress, user.address);
           borrowInput.add64(borrow);
           const encBorrow = await borrowInput.encrypt();
-          const borrowTx = await borrowManager.connect(user).borrow(encBorrow.handles[0], encBorrow.inputProof);
-          await borrowTx.wait();
+          await (await borrowManager.connect(user).borrow(encBorrow.handles[0], encBorrow.inputProof)).wait();
 
-          // Decrypt debt and verify
           const debtHandle = await borrowManager.getDebtAmount(user.address);
           const decryptedDebt = await hre.fhevm.userDecryptEuint(FhevmType.euint64, debtHandle, borrowAddress, user);
 
@@ -124,23 +191,17 @@ describe("FHE Private Lending - Property Tests", function () {
 
   /**
    * Property 6: Health Factor Enforcement
-   *
-   * For any collateral C and borrow B where C * 100 < B * 150 (unhealthy),
-   * after attempting to borrow B, the debt handle should decrypt to 0
-   * (the borrow was silently rejected).
-   *
+   * Undercollateralized borrow is silently rejected — debt stays 0.
    * Feature: fhe-private-lending, Property 6: Health factor enforcement
    * Validates: Requirements 3.2, 8.7
    */
-  it("Property 6: Health factor enforcement - undercollateralized borrow is silently rejected (debt stays 0)", async function () {
+  it("Property 6: Health factor enforcement - undercollateralized borrow is silently rejected", async function () {
     const signers = await hre.ethers.getSigners();
 
     await fc.assert(
       fc.asyncProperty(
-        // Generate borrow B in [2, 1000], then collateral C < ceil(B * 150 / 100)
         fc.bigInt({ min: 2n, max: 1_000n }).chain((borrow) => {
-          const maxCollateral = (borrow * 150n) / 100n - 1n; // strictly less than required
-          // Ensure maxCollateral >= 1
+          const maxCollateral = (borrow * 150n) / 100n - 1n;
           if (maxCollateral < 1n) return fc.tuple(fc.constant(1n), fc.constant(borrow));
           return fc.tuple(
             fc.bigInt({ min: 1n, max: maxCollateral }),
@@ -151,33 +212,27 @@ describe("FHE Private Lending - Property Tests", function () {
           const user = signers[3];
 
           const VaultFactory = await hre.ethers.getContractFactory("PrivateCollateralVault");
-          const vault = await VaultFactory.connect(user).deploy();
+          const vault = (await VaultFactory.connect(user).deploy()) as unknown as CollateralVault;
           await vault.waitForDeployment();
           const vaultAddress = await vault.getAddress();
 
           const BorrowFactory = await hre.ethers.getContractFactory("PrivateBorrowManager");
-          const borrowManager = await BorrowFactory.connect(user).deploy(vaultAddress);
+          const borrowManager = (await BorrowFactory.connect(user).deploy(vaultAddress)) as unknown as BorrowManager;
           await borrowManager.waitForDeployment();
           const borrowAddress = await borrowManager.getAddress();
 
-          // Authorize borrow manager to use collateral handles in FHE ops
           await (await vault.connect(user).authorizeContract(borrowAddress)).wait();
 
-          // Deposit (insufficient) collateral
           const collateralInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
           collateralInput.add64(collateral);
           const encCollateral = await collateralInput.encrypt();
-          const depositTx = await vault.connect(user).depositCollateral(encCollateral.handles[0], encCollateral.inputProof);
-          await depositTx.wait();
+          await (await vault.connect(user).depositCollateral(encCollateral.handles[0], encCollateral.inputProof)).wait();
 
-          // Attempt borrow (should be silently rejected)
           const borrowInput = hre.fhevm.createEncryptedInput(borrowAddress, user.address);
           borrowInput.add64(borrow);
           const encBorrow = await borrowInput.encrypt();
-          const borrowTx = await borrowManager.connect(user).borrow(encBorrow.handles[0], encBorrow.inputProof);
-          await borrowTx.wait();
+          await (await borrowManager.connect(user).borrow(encBorrow.handles[0], encBorrow.inputProof)).wait();
 
-          // Decrypt debt — should be 0 (borrow rejected)
           const debtHandle = await borrowManager.getDebtAmount(user.address);
           const decryptedDebt = await hre.fhevm.userDecryptEuint(FhevmType.euint64, debtHandle, borrowAddress, user);
 
@@ -190,15 +245,11 @@ describe("FHE Private Lending - Property Tests", function () {
 
   /**
    * Property 3: Supply Round-Trip
-   *
-   * For any valid uint64 amount, supplying that amount into PrivateLendingPool
-   * and then performing a user-decryption of the supplied balance handle should
-   * return the supplied amount.
-   *
+   * For any uint64 amount, supply then decrypt returns the same amount.
    * Feature: fhe-private-lending, Property 3: Supply round-trip
    * Validates: Requirements 4.1, 4.5, 8.5
    */
-  it("Property 3: Supply round-trip - for any uint64 amount, supply then decrypt returns the same amount", async function () {
+  it("Property 3: Supply round-trip", async function () {
     const signers = await hre.ethers.getSigners();
 
     await fc.assert(
@@ -208,7 +259,7 @@ describe("FHE Private Lending - Property Tests", function () {
           const user = signers[5];
 
           const PoolFactory = await hre.ethers.getContractFactory("PrivateLendingPool");
-          const pool = await PoolFactory.connect(user).deploy();
+          const pool = (await PoolFactory.connect(user).deploy()) as unknown as LendingPool;
           await pool.waitForDeployment();
           const poolAddress = await pool.getAddress();
 
@@ -216,10 +267,9 @@ describe("FHE Private Lending - Property Tests", function () {
           input.add64(amount);
           const encryptedInput = await input.encrypt();
 
-          const tx = await (pool as any).connect(user).supply(encryptedInput.handles[0], encryptedInput.inputProof);
-          await tx.wait();
+          await (await pool.connect(user).supply(encryptedInput.handles[0], encryptedInput.inputProof)).wait();
 
-          const suppliedHandle = await (pool as any).getSuppliedAmount(user.address);
+          const suppliedHandle = await pool.getSuppliedAmount(user.address);
           const decrypted = await hre.fhevm.userDecryptEuint(FhevmType.euint64, suppliedHandle, poolAddress, user);
 
           expect(decrypted).to.equal(amount);
@@ -231,11 +281,7 @@ describe("FHE Private Lending - Property Tests", function () {
 
   /**
    * Property 4: Repay Round-Trip
-   *
-   * For any valid (collateral C, borrow B, repay R) where the borrow is healthy
-   * and R <= B, after depositing C, borrowing B, and repaying R, a user-decryption
-   * of the debt handle should return B - R.
-   *
+   * After borrow B then repay R (R <= B), debt = B - R.
    * Feature: fhe-private-lending, Property 4: Repay round-trip
    * Validates: Requirements 3.3, 3.5
    */
@@ -244,7 +290,6 @@ describe("FHE Private Lending - Property Tests", function () {
 
     await fc.assert(
       fc.asyncProperty(
-        // Generate borrow B in [1, 500], repay R in [0, B], collateral >= ceil(B * 1.5)
         fc.bigInt({ min: 1n, max: 500n }).chain((borrow) => {
           const minCollateral = (borrow * 150n + 99n) / 100n;
           return fc.tuple(
@@ -257,37 +302,32 @@ describe("FHE Private Lending - Property Tests", function () {
           const user = signers[4];
 
           const VaultFactory = await hre.ethers.getContractFactory("PrivateCollateralVault");
-          const vault = await VaultFactory.connect(user).deploy();
+          const vault = (await VaultFactory.connect(user).deploy()) as unknown as CollateralVault;
           await vault.waitForDeployment();
           const vaultAddress = await vault.getAddress();
 
           const BorrowFactory = await hre.ethers.getContractFactory("PrivateBorrowManager");
-          const borrowManager = await BorrowFactory.connect(user).deploy(vaultAddress);
+          const borrowManager = (await BorrowFactory.connect(user).deploy(vaultAddress)) as unknown as BorrowManager;
           await borrowManager.waitForDeployment();
           const borrowAddress = await borrowManager.getAddress();
 
-          // Authorize borrow manager to use collateral handles in FHE ops
           await (await vault.connect(user).authorizeContract(borrowAddress)).wait();
 
-          // Deposit collateral
           const collateralInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
           collateralInput.add64(collateral);
           const encCollateral = await collateralInput.encrypt();
           await (await vault.connect(user).depositCollateral(encCollateral.handles[0], encCollateral.inputProof)).wait();
 
-          // Borrow
           const borrowInput = hre.fhevm.createEncryptedInput(borrowAddress, user.address);
           borrowInput.add64(borrow);
           const encBorrow = await borrowInput.encrypt();
           await (await borrowManager.connect(user).borrow(encBorrow.handles[0], encBorrow.inputProof)).wait();
 
-          // Repay
           const repayInput = hre.fhevm.createEncryptedInput(borrowAddress, user.address);
           repayInput.add64(repay);
           const encRepay = await repayInput.encrypt();
           await (await borrowManager.connect(user).repay(encRepay.handles[0], encRepay.inputProof)).wait();
 
-          // Decrypt debt and verify it equals borrow - repay
           const debtHandle = await borrowManager.getDebtAmount(user.address);
           const decryptedDebt = await hre.fhevm.userDecryptEuint(FhevmType.euint64, debtHandle, borrowAddress, user);
 
@@ -300,21 +340,15 @@ describe("FHE Private Lending - Property Tests", function () {
 
   /**
    * Property 5: Liquidation Correctness
-   *
-   * For any collateral C and debt D where C * 100 < D * 125 (undercollateralized),
-   * after calling auditHealth and resolveAudit with the correct decryption proof,
-   * isLiquidatable[user] should be true.
-   *
+   * Undercollateralized position is marked liquidatable after audit+resolve.
    * Feature: fhe-private-lending, Property 5: Liquidation correctness
    * Validates: Requirements 5.1, 5.2, 5.3, 5.4
    */
-  it("Property 5: Liquidation correctness - undercollateralized position is marked liquidatable after audit+resolve", async function () {
+  it("Property 5: Liquidation correctness - undercollateralized position is marked liquidatable", async function () {
     const signers = await hre.ethers.getSigners();
 
     await fc.assert(
       fc.asyncProperty(
-        // Generate debt D in [2, 500], collateral C where C * 100 < D * 125
-        // i.e. C < D * 1.25, so C <= floor(D * 125 / 100) - 1
         fc.bigInt({ min: 2n, max: 500n }).chain((debt) => {
           const maxCollateral = (debt * 125n) / 100n - 1n;
           if (maxCollateral < 1n) return fc.tuple(fc.constant(1n), fc.constant(debt));
@@ -327,32 +361,25 @@ describe("FHE Private Lending - Property Tests", function () {
           const user = signers[6];
           const liquidator = signers[7];
 
-          // Deploy fresh contracts
           const VaultFactory = await hre.ethers.getContractFactory("PrivateCollateralVault");
-          const vault = await VaultFactory.connect(user).deploy();
+          const vault = (await VaultFactory.connect(user).deploy()) as unknown as CollateralVault;
           await vault.waitForDeployment();
           const vaultAddress = await vault.getAddress();
 
           const BorrowFactory = await hre.ethers.getContractFactory("PrivateBorrowManager");
-          const borrowManager = await BorrowFactory.connect(user).deploy(vaultAddress);
+          const borrowManager = (await BorrowFactory.connect(user).deploy(vaultAddress)) as unknown as BorrowManager;
           await borrowManager.waitForDeployment();
           const borrowAddress = await borrowManager.getAddress();
 
           const LiqFactory = await hre.ethers.getContractFactory("PrivateLiquidationEngine");
-          const liqEngine = await LiqFactory.connect(user).deploy(vaultAddress, borrowAddress);
+          const liqEngine = (await LiqFactory.connect(user).deploy(vaultAddress, borrowAddress)) as unknown as LiquidationEngine;
           await liqEngine.waitForDeployment();
           const liqAddress = await liqEngine.getAddress();
 
-          // Authorize borrow manager to read collateral handles
           await (await vault.connect(user).authorizeContract(borrowAddress)).wait();
-          // Authorize liquidation engine to read collateral and debt handles
           await (await vault.connect(user).authorizeContract(liqAddress)).wait();
           await (await borrowManager.connect(user).authorizeContract(liqAddress)).wait();
 
-          // To create an undercollateralized position:
-          // 1. Deposit enough collateral to borrow `debt` (requires collateral >= debt * 1.5)
-          // 2. Borrow `debt`
-          // 3. Withdraw collateral down to `collateral` (leaving collateral * 100 < debt * 125)
           const minCollateralForBorrow = (debt * 150n + 99n) / 100n;
 
           const depositInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
@@ -360,13 +387,11 @@ describe("FHE Private Lending - Property Tests", function () {
           const encDeposit = await depositInput.encrypt();
           await (await vault.connect(user).depositCollateral(encDeposit.handles[0], encDeposit.inputProof)).wait();
 
-          // Borrow `debt`
           const borrowInput = hre.fhevm.createEncryptedInput(borrowAddress, user.address);
           borrowInput.add64(debt);
           const encBorrow = await borrowInput.encrypt();
           await (await borrowManager.connect(user).borrow(encBorrow.handles[0], encBorrow.inputProof)).wait();
 
-          // Withdraw collateral down to `collateral` (leaving position undercollateralized)
           const withdrawAmt = minCollateralForBorrow - collateral;
           if (withdrawAmt > 0n) {
             const withdrawInput = hre.fhevm.createEncryptedInput(vaultAddress, user.address);
@@ -375,22 +400,18 @@ describe("FHE Private Lending - Property Tests", function () {
             await (await vault.connect(user).withdrawCollateral(encWithdraw.handles[0], encWithdraw.inputProof)).wait();
           }
 
-          // Audit health
           await (await liqEngine.connect(liquidator).auditHealth(user.address)).wait();
 
-          // Get the pending health check handle and perform public decryption
           const pendingHandle = await liqEngine.getPendingHealthCheck(user.address);
           const handleHex = ethers.toBeHex(ethers.toBigInt(pendingHandle), 32);
           const publicDecryptResult = await hre.fhevm.publicDecrypt([handleHex]);
 
-          // Resolve audit with the decryption proof
           await (await liqEngine.connect(liquidator).resolveAudit(
             user.address,
             publicDecryptResult.abiEncodedClearValues,
             publicDecryptResult.decryptionProof,
           )).wait();
 
-          // Assert: user is now marked as liquidatable
           const liquidatable = await liqEngine.isLiquidatable(user.address);
           expect(liquidatable).to.equal(true);
         },

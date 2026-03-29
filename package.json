@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "hardhat test",
-    "deploy:local": "hardhat run scripts/deploy-local-hardhat.js --network localhost"
+    "deploy:local": "hardhat run scripts/deploy-local-hardhat.js --network localhost",
+    "deploy:tokens": "hardhat run scripts/deploy-tokens.js --network localhost"
   },
   "keywords": [],
   "author": "",

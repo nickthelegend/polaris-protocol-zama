@@ -25,12 +25,12 @@ module.exports = {
     },
     // Zama FHEVM testnet (Sepolia-based)
     sepolia: {
-      url: process.env.SEPOLIA_RPC_URL || "https://1rpc.io/sepolia",
+      url: process.env.SEPOLIA_RPC_URL || "https://rpc.ankr.com/eth_sepolia",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
       chainId: 11155111,
     },
   },
   fhevm: {
-    mocked: true,
+    mocked: false,
   },
 };

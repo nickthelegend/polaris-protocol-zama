@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause-Clear
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import { FHE, euint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
@@ -79,15 +79,24 @@ contract PrivateLiquidationEngine is ZamaEthereumConfig {
         bytes memory abiEncodedClearResult,
         bytes memory decryptionProof
     ) external {
+        ebool check = pendingHealthChecks[user];
+        require(FHE.isInitialized(check), "No pending audit");
+
         bytes32[] memory handles = new bytes32[](1);
-        handles[0] = ebool.unwrap(pendingHealthChecks[user]);
+        handles[0] = FHE.toBytes32(check);
+        
         FHE.checkSignatures(handles, abiEncodedClearResult, decryptionProof);
 
         bool isUnhealthy = abi.decode(abiEncodedClearResult, (bool));
         require(isUnhealthy, "User is healthy, cannot liquidate");
 
         isLiquidatable[user] = true;
-        pendingHealthChecks[user] = ebool.wrap(0);
+        // Correct way to clear is to set to uninitialized/zero via casting if needed, 
+        // but here we just leave it or could asEbool(false) and allowThis.
+        // Let's just use asEbool(false) to clear.
+        ebool cleared = FHE.asEbool(false);
+        FHE.allowThis(cleared);
+        pendingHealthChecks[user] = cleared;
 
         emit Liquidated(user, msg.sender);
     }

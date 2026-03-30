@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause-Clear
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
@@ -65,26 +65,33 @@ contract PrivateBorrowManager is ZamaEthereumConfig {
      */
     function borrow(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         euint64 amountToBorrow = FHE.fromExternal(encryptedAmount, inputProof);
-        euint64 currentDebt = debtAmounts[msg.sender];
+        
+        euint64 currentDebt;
+        if (FHE.isInitialized(debtAmounts[msg.sender])) {
+            currentDebt = debtAmounts[msg.sender];
+        } else {
+            currentDebt = FHE.asEuint64(0);
+        }
+        
         euint64 collateral = collateralVault.getCollateralAmount(msg.sender);
 
         // Calculate new debt
         euint64 newDebt = FHE.add(currentDebt, amountToBorrow);
 
-        // Check health factor: collateral >= newDebt * 1.5
-        // -> collateral * 100 >= newDebt * 150
+        // Check health factor: collateral * 100 >= newDebt * 150
         euint64 weightedCollateral = FHE.mul(collateral, FHE.asEuint64(100));
         euint64 requiredCollateral = FHE.mul(newDebt, FHE.asEuint64(COLLATERAL_RATIO));
 
         ebool isHealthy = FHE.ge(weightedCollateral, requiredCollateral);
 
         // Only update debt if it's healthy (branchless)
-        debtAmounts[msg.sender] = FHE.select(isHealthy, newDebt, currentDebt);
+        euint64 finalizedDebt = FHE.select(isHealthy, newDebt, currentDebt);
+        debtAmounts[msg.sender] = finalizedDebt;
 
         // Access control
-        FHE.allowThis(debtAmounts[msg.sender]);
-        FHE.allow(debtAmounts[msg.sender], msg.sender);
-        _grantAuthorizedAccess(debtAmounts[msg.sender]);
+        FHE.allowThis(finalizedDebt);
+        FHE.allow(finalizedDebt, msg.sender);
+        _grantAuthorizedAccess(finalizedDebt);
 
         emit Borrowed(msg.sender);
     }
@@ -96,18 +103,20 @@ contract PrivateBorrowManager is ZamaEthereumConfig {
      */
     function repay(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         euint64 amountToRepay = FHE.fromExternal(encryptedAmount, inputProof);
+        
+        require(FHE.isInitialized(debtAmounts[msg.sender]), "No debt found");
         euint64 currentDebt = debtAmounts[msg.sender];
 
         ebool hasDebt = FHE.le(amountToRepay, currentDebt);
-
         euint64 amountToSubtract = FHE.select(hasDebt, amountToRepay, currentDebt);
 
-        debtAmounts[msg.sender] = FHE.sub(currentDebt, amountToSubtract);
+        euint64 newDebt = FHE.sub(currentDebt, amountToSubtract);
+        debtAmounts[msg.sender] = newDebt;
 
         // Access control
-        FHE.allowThis(debtAmounts[msg.sender]);
-        FHE.allow(debtAmounts[msg.sender], msg.sender);
-        _grantAuthorizedAccess(debtAmounts[msg.sender]);
+        FHE.allowThis(newDebt);
+        FHE.allow(newDebt, msg.sender);
+        _grantAuthorizedAccess(newDebt);
 
         emit Repaid(msg.sender);
     }

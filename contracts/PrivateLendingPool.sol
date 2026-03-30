@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause-Clear
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
@@ -37,17 +37,19 @@ contract PrivateLendingPool is ZamaEthereumConfig {
     function supply(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
 
+        euint64 newSupplied;
         if (FHE.isInitialized(suppliedAmounts[msg.sender])) {
-            suppliedAmounts[msg.sender] = FHE.add(suppliedAmounts[msg.sender], amount);
+            newSupplied = FHE.add(suppliedAmounts[msg.sender], amount);
         } else {
-            suppliedAmounts[msg.sender] = amount;
+            newSupplied = amount;
         }
+        suppliedAmounts[msg.sender] = newSupplied;
 
         totalLiquidity = FHE.add(totalLiquidity, amount);
 
         // Access control
-        FHE.allowThis(suppliedAmounts[msg.sender]);
-        FHE.allow(suppliedAmounts[msg.sender], msg.sender);
+        FHE.allowThis(newSupplied);
+        FHE.allow(newSupplied, msg.sender);
         FHE.allowThis(totalLiquidity);
 
         emit Supplied(msg.sender);
@@ -60,18 +62,20 @@ contract PrivateLendingPool is ZamaEthereumConfig {
      */
     function withdraw(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
+        
+        require(FHE.isInitialized(suppliedAmounts[msg.sender]), "No suicide found");
         euint64 currentBalance = suppliedAmounts[msg.sender];
 
         ebool hasBalance = FHE.le(amount, currentBalance);
-
         euint64 amountToSubtract = FHE.select(hasBalance, amount, currentBalance);
 
-        suppliedAmounts[msg.sender] = FHE.sub(currentBalance, amountToSubtract);
+        euint64 newSupplied = FHE.sub(currentBalance, amountToSubtract);
+        suppliedAmounts[msg.sender] = newSupplied;
         totalLiquidity = FHE.sub(totalLiquidity, amountToSubtract);
 
         // Access control
-        FHE.allowThis(suppliedAmounts[msg.sender]);
-        FHE.allow(suppliedAmounts[msg.sender], msg.sender);
+        FHE.allowThis(newSupplied);
+        FHE.allow(newSupplied, msg.sender);
         FHE.allowThis(totalLiquidity);
 
         emit Withdrawn(msg.sender);

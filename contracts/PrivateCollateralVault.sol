@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause-Clear
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import { FHE, euint64, externalEuint64, ebool } from "@fhevm/solidity/lib/FHE.sol";
@@ -49,16 +49,18 @@ contract PrivateCollateralVault is ZamaEthereumConfig {
     function depositCollateral(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
 
+        euint64 newCollateral;
         if (FHE.isInitialized(collateralAmounts[msg.sender])) {
-            collateralAmounts[msg.sender] = FHE.add(collateralAmounts[msg.sender], amount);
+            newCollateral = FHE.add(collateralAmounts[msg.sender], amount);
         } else {
-            collateralAmounts[msg.sender] = amount;
+            newCollateral = amount;
         }
+        collateralAmounts[msg.sender] = newCollateral;
 
         // Access control: grant to this contract, the user, and any authorized managers
-        FHE.allowThis(collateralAmounts[msg.sender]);
-        FHE.allow(collateralAmounts[msg.sender], msg.sender);
-        _grantAuthorizedAccess(collateralAmounts[msg.sender]);
+        FHE.allowThis(newCollateral);
+        FHE.allow(newCollateral, msg.sender);
+        _grantAuthorizedAccess(newCollateral);
 
         emit CollateralDeposited(msg.sender);
     }
@@ -70,17 +72,21 @@ contract PrivateCollateralVault is ZamaEthereumConfig {
      */
     function withdrawCollateral(externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
+        
+        require(FHE.isInitialized(collateralAmounts[msg.sender]), "No collateral found");
         euint64 currentCollateral = collateralAmounts[msg.sender];
 
         // Cap withdrawal at current balance (branchless, no underflow)
         ebool hasCollateral = FHE.le(amount, currentCollateral);
         euint64 amountToSubtract = FHE.select(hasCollateral, amount, currentCollateral);
-        collateralAmounts[msg.sender] = FHE.sub(currentCollateral, amountToSubtract);
+        
+        euint64 newCollateral = FHE.sub(currentCollateral, amountToSubtract);
+        collateralAmounts[msg.sender] = newCollateral;
 
         // Access control: grant to this contract, the user, and any authorized managers
-        FHE.allowThis(collateralAmounts[msg.sender]);
-        FHE.allow(collateralAmounts[msg.sender], msg.sender);
-        _grantAuthorizedAccess(collateralAmounts[msg.sender]);
+        FHE.allowThis(newCollateral);
+        FHE.allow(newCollateral, msg.sender);
+        _grantAuthorizedAccess(newCollateral);
 
         emit CollateralWithdrawn(msg.sender);
     }

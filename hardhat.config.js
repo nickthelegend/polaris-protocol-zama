@@ -16,7 +16,9 @@ module.exports = {
     },
   },
   networks: {
-    // Zama FHEVM testnet (Sepolia-based)
+    hardhat: {
+      chainId: 31337,
+    },
     sepolia: {
       url: process.env.SEPOLIA_RPC_URL || "https://rpc.ankr.com/eth_sepolia",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
@@ -25,5 +27,8 @@ module.exports = {
   },
   fhevm: {
     mocked: false,
+  },
+  etherscan: {
+    apiKey: process.env.ETHERSCAN_API_KEY || "",
   },
 };

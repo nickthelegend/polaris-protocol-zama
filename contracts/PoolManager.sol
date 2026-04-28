@@ -70,6 +70,10 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         }
     }
 
+    function setLoanEngine(address _loanEngine) external onlyOwner {
+        loanEngine = _loanEngine;
+    }
+
     function setWhitelistedToken(address token, bool status) external onlyOwner {
         if (status && !isTokenWhitelisted[token]) whitelistedTokens.push(token);
         isTokenWhitelisted[token] = status;
@@ -82,7 +86,7 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         emit SourceChainConfigured(chainId, vault, token, status);
     }
 
-    function setLoanEngine(address _loanEngine) external onlyOwner { loanEngine = _loanEngine; }
+
 
     function addLiquidityFromProof(
         uint64 chainKey, uint64 blockHeight, bytes calldata encodedTransaction,

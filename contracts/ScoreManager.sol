@@ -1,26 +1,30 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./PoolManager.sol";
 import "./CreditOracle.sol";
+import {FHE, euint64, euint32, ebool} from "@fhevm/solidity/lib/FHE.sol";
+import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 
 /**
  * @title ScoreManager
- * @dev Manages user credit scores and calculates dynamic borrowing limits.
+ * @dev Manages user credit scores and calculates dynamic borrowing limits using Zama FHEVM.
  */
-contract ScoreManager is Ownable {
+contract ScoreManager is Ownable, ZamaEthereumConfig {
     PoolManager public poolManager;
     CreditOracle public creditOracle;
 
     // Minimum score starts at 300 (Like FICO)
-    uint256 public constant MIN_SCORE = 300;
-    uint256 public constant MAX_SCORE = 850;
+    uint32 public constant MIN_SCORE = 300;
+    uint32 public constant MAX_SCORE = 850;
 
-    mapping(address => uint256) public scores;
-    mapping(address => uint256) public totalRepaidMap;
+    // user => score (Encrypted)
+    mapping(address => euint32) private scores;
+    // user => totalRepaid (Encrypted)
+    mapping(address => euint64) private totalRepaidMap;
 
-    event ScoreUpdated(address indexed user, uint256 newScore, string reason);
+    event ScoreUpdated(address indexed user, uint32 newScore, string reason);
     event OracleUpdated(address indexed newOracle);
 
     constructor(address _poolManager, address _creditOracle) Ownable(msg.sender) {
@@ -29,42 +33,48 @@ contract ScoreManager is Ownable {
     }
 
     /**
-     * @dev Gets the user's current credit score. Returns MIN_SCORE if new user.
+     * @dev Gets the user's current credit score (Encrypted).
      */
-    function getScore(address user) public view returns (uint256) {
-        uint256 score = scores[user];
-        if (score == 0) return MIN_SCORE;
-        return score;
+    function getScore(address user) public returns (euint32) {
+        if (!FHE.isInitialized(scores[user])) return FHE.asEuint32(uint32(MIN_SCORE));
+        return scores[user];
     }
 
     /**
-     * @dev Updates user score based on repayment behavior.
-     * Can only be called by LoanEngine (Owner or specialized role in prod).
+     * @dev Updates user score based on behavior (Encrypted delta).
      */
-    function updateScore(address user, int256 delta, string memory reason) public onlyOwner {
-        uint256 current = getScore(user);
-        int256 newScore = int256(current) + delta;
+    function updateScore(address user, int32 delta, string memory reason) public onlyOwner {
+        euint32 current = getScore(user);
+        euint32 newScore;
+        
+        if (delta >= 0) {
+            newScore = FHE.add(current, uint32(delta));
+            // Cap at MAX_SCORE
+            ebool isOver = FHE.gt(newScore, FHE.asEuint32(uint32(MAX_SCORE)));
+            newScore = FHE.select(isOver, FHE.asEuint32(uint32(MAX_SCORE)), newScore);
+        } else {
+            uint32 absDelta = uint32(-delta);
+            ebool canSub = FHE.gt(current, FHE.asEuint32(uint32(absDelta + MIN_SCORE)));
+            newScore = FHE.select(canSub, FHE.sub(current, absDelta), FHE.asEuint32(uint32(MIN_SCORE)));
+        }
 
-        if (newScore < int256(MIN_SCORE)) newScore = int256(MIN_SCORE);
-        if (newScore > int256(MAX_SCORE)) newScore = int256(MAX_SCORE);
-
-        scores[user] = uint256(newScore);
-        emit ScoreUpdated(user, uint256(newScore), reason);
+        scores[user] = newScore;
+        FHE.allow(newScore, user);
+        FHE.allowThis(newScore);
+        
+        emit ScoreUpdated(user, 0, reason); // Score value is private
     }
 
-    /**
-     * @dev Records a successful repayment.
-     * Logic: +5 points for every $100 repaid, max +20 per transaction.
-     */
-    function recordRepayment(address user, uint256 amount) external onlyOwner {
-        totalRepaidMap[user] += amount;
+    function recordRepayment(address user, euint64 amount) external onlyOwner {
+        if (FHE.isInitialized(totalRepaidMap[user])) {
+            totalRepaidMap[user] = FHE.add(totalRepaidMap[user], amount);
+        } else {
+            totalRepaidMap[user] = amount;
+        }
+        FHE.allow(totalRepaidMap[user], user);
+        FHE.allowThis(totalRepaidMap[user]);
         
-        // Simple heuristic: Boost score based on volume
-        // In real system, this would be more complex (on-time vs late)
-        // Here we just give small boost for activity
-        
-        // 10 points for every repayment (activity bonus)
-        // capped at decent intervals
+        // Activity bonus: +5 points
         updateScore(user, 5, "Repayment Bonus");
     }
 
@@ -74,35 +84,30 @@ contract ScoreManager is Ownable {
     }
 
     /**
-     * @dev Calculates the max borrow amount for a user.
+     * @dev Calculates the max borrow amount for a user (Encrypted).
      * Formula: (Total Native Collateral + External Net Value) * (Score / 1000).
-     * This sums liquidity across local pools and aggregated Aave/Morpho/Compound data.
      */
-    function getCreditLimit(address user) public view returns (uint256) {
-        // 1. Get user total aggregated collateral across all chains/tokens from PoolManager
-        uint256 nativeCollateral = poolManager.getUserTotalCollateral(user);
+    function getCreditLimit(address user) public returns (euint64) {
+        euint64 nativeCollateral = poolManager.getUserTotalCollateral(user);
         
-        // 2. Get external net value from Oracle (Attested Aave/Morpho/Compound data)
-        int256 externalNetValue = creditOracle.getExternalNetValue(user);
+        // Get encrypted net value from external sources
+        (euint64 externalNetValue, ebool isPositive) = creditOracle.getEncryptedNetValue(user);
         
-        uint256 totalEffectiveCollateral;
-        if (externalNetValue > 0) {
-            totalEffectiveCollateral = nativeCollateral + uint256(externalNetValue);
-        } else {
-            // If debt > collateral externally, it reduces native borrowing power
-            uint256 debtToSubtract = uint256(-externalNetValue);
-            if (debtToSubtract >= nativeCollateral) {
-                totalEffectiveCollateral = 0;
-            } else {
-                totalEffectiveCollateral = nativeCollateral - debtToSubtract;
-            }
-        }
+        euint64 totalEffectiveCollateral;
+        // if (isPositive) total = native + external else total = native - external (clamped at 0)
+        euint64 sum = FHE.add(nativeCollateral, externalNetValue);
+        
+        ebool canSub = FHE.gt(nativeCollateral, externalNetValue);
+        euint64 diff = FHE.select(canSub, FHE.sub(nativeCollateral, externalNetValue), FHE.asEuint64(0));
+        
+        totalEffectiveCollateral = FHE.select(isPositive, sum, diff);
 
-        if (totalEffectiveCollateral == 0) return 0;
-
-        uint256 score = getScore(user);
+        euint32 score = getScore(user);
         
         // Multiplier: Score / 1000
-        return (totalEffectiveCollateral * score) / 1000;
+        // (totalEffectiveCollateral * score) / 1000
+        return FHE.div(FHE.mul(totalEffectiveCollateral, FHE.asEuint64(score)), 1000);
     }
 }
+
+

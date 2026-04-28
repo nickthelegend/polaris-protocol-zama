@@ -26,7 +26,7 @@ module.exports = {
     },
   },
   fhevm: {
-    mocked: false,
+    mocked: true,
   },
   etherscan: {
     apiKey: process.env.ETHERSCAN_API_KEY || "",

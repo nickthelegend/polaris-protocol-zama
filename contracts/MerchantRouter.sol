@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./PoolManager.sol";
 import "./LoanEngine.sol";
+import {FHE, euint64, externalEuint64, ebool} from "@fhevm/solidity/lib/FHE.sol";
+import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 
 /**
  * @title MerchantRouter
- * @dev Routes payments to merchants from Creditcoin pools.
- * Bridges Consumer Credit (Loans) to Merchant Liquidity.
+ * @dev Routes payments to merchants privately using Zama FHEVM.
  */
-contract MerchantRouter is Ownable {
+contract MerchantRouter is Ownable, ZamaEthereumConfig {
     PoolManager public poolManager;
     LoanEngine public loanEngine;
 
-    // Merchant balances (in specific tokens)
-    mapping(address => mapping(address => uint256)) public merchantBalances;
+    // Merchant balances (Encrypted)
+    mapping(address => mapping(address => euint64)) private merchantBalances;
 
-    event MerchantPaid(address indexed customer, address indexed merchant, address indexed token, uint256 amount);
-    event MerchantWithdrawn(address indexed merchant, address indexed token, uint256 amount);
+    event MerchantPaid(address indexed customer, address indexed merchant, address indexed token);
+    event MerchantWithdrawn(address indexed merchant, address indexed token);
 
     constructor(address _poolManager, address _loanEngine) Ownable(msg.sender) {
         poolManager = PoolManager(_poolManager);
@@ -26,34 +27,52 @@ contract MerchantRouter is Ownable {
     }
 
     /**
-     * @dev Customer pays a merchant using their credit line.
-     * This automatically triggers a BNPL loan for the customer.
+     * @dev Customer pays a merchant using their credit line (Encrypted).
      */
-    function payWithCredit(address merchant, address tokenOnSource, uint256 amount) external {
+    function payWithCredit(address merchant, address tokenOnSource, externalEuint64 encryptedAmount, bytes calldata inputProof) external {
+        euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
+        
         // 1. Create a loan for the customer (msg.sender)
-        // LoanEngine checks credit limit based on ScoreManager/LP balance
-        loanEngine.createLoan(msg.sender, amount, tokenOnSource);
+        loanEngine.createLoan(msg.sender, encryptedAmount, inputProof, tokenOnSource);
 
         // 2. Crediting the merchant
-        // In a full implementation, this might bridge funds.
-        // For USC demo, we track it on-chain.
-        merchantBalances[merchant][tokenOnSource] += amount;
+        if (FHE.isInitialized(merchantBalances[merchant][tokenOnSource])) {
+            merchantBalances[merchant][tokenOnSource] = FHE.add(merchantBalances[merchant][tokenOnSource], amount);
+        } else {
+            merchantBalances[merchant][tokenOnSource] = amount;
+        }
 
-        emit MerchantPaid(msg.sender, merchant, tokenOnSource, amount);
+        // Allow merchant to see their balance
+        FHE.allow(merchantBalances[merchant][tokenOnSource], merchant);
+        FHE.allowThis(merchantBalances[merchant][tokenOnSource]);
+
+        emit MerchantPaid(msg.sender, merchant, tokenOnSource);
     }
 
     /**
-     * @dev Merchant withdraws their earned funds.
+     * @dev Merchant withdraws their earned funds (Encrypted).
      */
-    function merchantWithdraw(address tokenOnSource, uint256 amount, uint64 destChainId) external {
-        require(merchantBalances[msg.sender][tokenOnSource] >= amount, "Insufficient merchant balance");
+    function merchantWithdraw(address tokenOnSource, externalEuint64 encryptedAmount, bytes calldata inputProof, uint64 destChainId) external {
+        euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
+        euint64 balance = merchantBalances[msg.sender][tokenOnSource];
         
-        merchantBalances[msg.sender][tokenOnSource] -= amount;
+        ebool hasBalance = FHE.ge(balance, amount);
+        euint64 actualAmount = FHE.select(hasBalance, amount, balance);
         
-        // Relies on PoolManager to authorize withdrawal or send funds
-        // For simplicity, we trigger a withdrawal request from the global pool
-        poolManager.requestWithdrawal(tokenOnSource, amount, destChainId);
+        merchantBalances[msg.sender][tokenOnSource] = FHE.sub(balance, actualAmount);
+        FHE.allow(merchantBalances[msg.sender][tokenOnSource], msg.sender);
+        FHE.allowThis(merchantBalances[msg.sender][tokenOnSource]);
+        
+        // Relies on PoolManager to authorize withdrawal. 
+        // We pass the encrypted amount to PoolManager.
+        // PoolManager will decrypt it for the bridge event.
+        poolManager.requestWithdrawal(tokenOnSource, encryptedAmount, inputProof, destChainId);
 
-        emit MerchantWithdrawn(msg.sender, tokenOnSource, amount);
+        emit MerchantWithdrawn(msg.sender, tokenOnSource);
+    }
+
+    function getMerchantBalance(address merchant, address token) external view returns (euint64) {
+        return merchantBalances[merchant][token];
     }
 }
+

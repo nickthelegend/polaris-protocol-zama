@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -7,10 +7,11 @@ import "./ScoreManager.sol";
 import "./PoolManager.sol";
 import "./interfaces/INativeQueryVerifier.sol";
 import "./interfaces/EvmV1Decoder.sol";
-
 import "./ProtocolFunds.sol";
+import {FHE, euint64, externalEuint64, ebool} from "@fhevm/solidity/lib/FHE.sol";
+import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 
-contract LoanEngine is Ownable, ReentrancyGuard {
+contract LoanEngine is Ownable, ReentrancyGuard, ZamaEthereumConfig {
     ScoreManager public scoreManager;
     PoolManager public poolManager;
     ProtocolFunds public protocolFunds;
@@ -24,16 +25,18 @@ contract LoanEngine is Ownable, ReentrancyGuard {
     enum LoanStatus { Active, Repaid, Defaulted }
     struct Loan { 
         address borrower; 
-        uint256 principal; 
-        uint256 interestAmount;
-        uint256 repaid; 
+        euint64 principal; 
+        euint64 interestAmount;
+        euint64 repaid; 
         uint256 startTime; 
         uint256[] dueDates; 
         LoanStatus status; 
         address poolToken; 
     }
+    
     mapping(uint256 => Loan) public loans;
-    mapping(address => uint256) public userActiveDebt;
+    // user => debt (Encrypted)
+    mapping(address => euint64) private userActiveDebt;
     mapping(bytes32 => bool) public processedQueries;
     uint256 public loanCount;
 
@@ -53,15 +56,19 @@ contract LoanEngine is Ownable, ReentrancyGuard {
         }
     }
 
-    function createLoan(address user, uint256 amount, address poolToken) external {
-        uint256 limit = scoreManager.getCreditLimit(user);
-        require(userActiveDebt[user] + amount <= limit, "Exceeds limit");
+    function createLoan(address user, externalEuint64 amount, bytes calldata inputProof, address poolToken) external {
+        euint64 principal = FHE.fromExternal(amount, inputProof);
+        euint32 score = scoreManager.getScore(user);
+        euint64 limit = scoreManager.getCreditLimit(user);
+        euint64 currentDebt = userActiveDebt[user];
         
-        // Calculate 56-day interest (standard for this BNPL model)
-        // interest = principal * rate * time / 365
-        uint256 interest = (amount * INTEREST_RATE_BPS * 56) / (10000 * 365);
-        if (interest == 0) interest = 1; // Minimum 1 unit interest for demo
-
+        ebool isWithinLimit = FHE.le(FHE.add(currentDebt, principal), limit);
+        // If over limit, we effectively create a 0 principal loan (since we lack FHE.req)
+        euint64 actualPrincipal = FHE.select(isWithinLimit, principal, FHE.asEuint64(0));
+        
+        // Calculate 56-day interest: interest = actualPrincipal * rate * time / (10000 * 365)
+        euint64 interest = FHE.div(FHE.mul(actualPrincipal, uint64(56000)), uint64(3650000));
+        
         uint256[] memory dueDates = new uint256[](4);
         dueDates[0] = block.timestamp + 14 days;
         dueDates[1] = block.timestamp + 28 days;
@@ -70,17 +77,30 @@ contract LoanEngine is Ownable, ReentrancyGuard {
 
         loans[loanCount] = Loan({ 
             borrower: user, 
-            principal: amount, 
+            principal: actualPrincipal, 
             interestAmount: interest,
-            repaid: 0, 
+            repaid: FHE.asEuint64(0), 
             startTime: block.timestamp, 
             dueDates: dueDates, 
             status: LoanStatus.Active, 
             poolToken: poolToken 
         });
         
-        userActiveDebt[user] += amount;
-        emit LoanCreated(loanCount, user, amount, interest);
+        userActiveDebt[user] = FHE.add(currentDebt, actualPrincipal);
+        
+        // Access control for the user to see their loan data
+        FHE.allow(loans[loanCount].principal, user);
+        FHE.allow(loans[loanCount].interestAmount, user);
+        FHE.allow(loans[loanCount].repaid, user);
+        FHE.allow(userActiveDebt[user], user);
+        
+        // Allow this contract to use the handles later
+        FHE.allowThis(loans[loanCount].principal);
+        FHE.allowThis(loans[loanCount].interestAmount);
+        FHE.allowThis(loans[loanCount].repaid);
+        FHE.allowThis(userActiveDebt[user]);
+
+        emit LoanCreated(loanCount, user, 0, 0); // Principal/Interest are private
         loanCount++;
     }
 
@@ -108,49 +128,89 @@ contract LoanEngine is Ownable, ReentrancyGuard {
             require(logs[i].topics.length == 2, "Invalid topics");
             uint256 loanId = uint256(logs[i].topics[1]);
             uint256 amount = abi.decode(logs[i].data, (uint256));
-            _applyRepayment(loanId, amount);
+            _applyRepayment(loanId, FHE.asEuint64(uint64(amount)));
         }
         processedQueries[txKey] = true;
     }
 
-    function _applyRepayment(uint256 loanId, uint256 amount) internal {
+    function _applyRepayment(uint256 loanId, euint64 amount) internal {
         Loan storage loan = loans[loanId];
         require(loan.status == LoanStatus.Active, "Not active");
         
-        uint256 totalDebt = loan.principal + loan.interestAmount;
-        uint256 remainingToRepay = totalDebt - loan.repaid;
-        uint256 effectiveAmount = amount > remainingToRepay ? remainingToRepay : amount;
-
-        uint256 principalBefore = loan.repaid < loan.principal ? loan.repaid : loan.principal;
+        euint64 totalDebt = FHE.add(loan.principal, loan.interestAmount);
+        euint64 remainingToRepay = FHE.sub(totalDebt, loan.repaid);
         
-        loan.repaid += effectiveAmount;
+        ebool isOverpaying = FHE.gt(amount, remainingToRepay);
+        euint64 effectiveAmount = FHE.select(isOverpaying, remainingToRepay, amount);
         
-        // Handle Interest Distribution
-        uint256 interestPaid = 0;
-        if (loan.repaid > loan.principal) {
-            if (loan.repaid - effectiveAmount <= loan.principal) {
-                interestPaid = loan.repaid - loan.principal;
-            } else {
-                interestPaid = effectiveAmount;
-            }
-        }
+        loan.repaid = FHE.add(loan.repaid, effectiveAmount);
+        FHE.allow(loan.repaid, loan.borrower);
+        FHE.allowThis(loan.repaid);
+        
+        // Handle Interest Distribution (Encrypted)
+        ebool hasPaidPrincipal = FHE.gt(loan.repaid, loan.principal);
+        euint64 excessOverPrincipal = FHE.sub(loan.repaid, loan.principal);
+        euint64 interestPaid = FHE.select(hasPaidPrincipal, FHE.select(FHE.gt(excessOverPrincipal, effectiveAmount), effectiveAmount, excessOverPrincipal), FHE.asEuint64(0));
 
-        if (interestPaid > 0) {
-            uint256 protocolFee = (interestPaid * PROTOCOL_FEE_BPS) / 10000;
-            uint256 lenderYield = interestPaid - protocolFee;
-            
-            if (protocolFee > 0) protocolFunds.deposit(loan.poolToken, protocolFee);
-            if (lenderYield > 0) poolManager.distributeInterest(loan.poolToken, lenderYield);
-        }
+        // Distribution logic using encrypted arithmetic
+        euint64 protocolFee = FHE.div(FHE.mul(interestPaid, uint64(PROTOCOL_FEE_BPS)), uint64(10000));
+        euint64 lenderYield = FHE.sub(interestPaid, protocolFee);
+        
+        protocolFunds.deposit(loan.poolToken, protocolFee);
+        poolManager.distributeInterest(loan.poolToken, lenderYield);
 
+        // Record repayment in score manager (Encrypted)
         scoreManager.recordRepayment(loan.borrower, effectiveAmount);
-        emit RepaymentMade(loanId, effectiveAmount);
         
-        if (loan.repaid >= totalDebt) {
-            loan.status = LoanStatus.Repaid;
-            userActiveDebt[loan.borrower] -= loan.principal;
-            emit LoanFullyRepaid(loanId);
-        }
+        ebool isFullyRepaid = FHE.ge(loan.repaid, totalDebt);
+        FHE.allowThis(isFullyRepaid);
+        // Status change must be audited via auditRepayment (Step 1)
+        
+        emit RepaymentMade(loanId, 0); // Amount 0 indicates encrypted repayment
+    }
+
+    /**
+     * @notice Audit a loan to see if it's fully repaid (Step 1)
+     */
+    function auditRepayment(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(loan.status == LoanStatus.Active, "Not active");
+        
+        euint64 totalDebt = FHE.add(loan.principal, loan.interestAmount);
+        ebool isFullyRepaid = FHE.ge(loan.repaid, totalDebt);
+        
+        FHE.allowThis(isFullyRepaid);
+        FHE.makePubliclyDecryptable(isFullyRepaid);
+    }
+
+    /**
+     * @notice Finalize repayment audit (Step 2)
+     */
+    function finalizeRepaymentAudit(
+        uint256 loanId,
+        bytes memory abiEncodedClearResult,
+        bytes memory decryptionProof
+    ) external {
+        Loan storage loan = loans[loanId];
+        require(loan.status == LoanStatus.Active, "Not active");
+        
+        euint64 totalDebt = FHE.add(loan.principal, loan.interestAmount);
+        ebool isFullyRepaidEnc = FHE.ge(loan.repaid, totalDebt);
+        
+        bytes32[] memory handles = new bytes32[](1);
+        handles[0] = FHE.toBytes32(isFullyRepaidEnc);
+        
+        FHE.checkSignatures(handles, abiEncodedClearResult, decryptionProof);
+
+        bool isFullyRepaid = abi.decode(abiEncodedClearResult, (bool));
+        require(isFullyRepaid, "Not fully repaid");
+
+        loan.status = LoanStatus.Repaid;
+        userActiveDebt[loan.borrower] = FHE.sub(userActiveDebt[loan.borrower], loan.principal);
+        FHE.allow(userActiveDebt[loan.borrower], loan.borrower);
+        FHE.allowThis(userActiveDebt[loan.borrower]);
+        
+        emit LoanFullyRepaid(loanId);
     }
 
     function _checkForReplay(uint64 chainKey, uint64 blockHeight, INativeQueryVerifier.MerkleProofEntry[] memory siblings) 
@@ -161,25 +221,33 @@ contract LoanEngine is Ownable, ReentrancyGuard {
         return (!processedQueries[txKey], txKey);
     }
 
-    function checkLiquidatable(uint256 loanId) public view returns (bool) {
-        Loan storage loan = loans[loanId];
-        if (loan.status != LoanStatus.Active) return false;
-        return (block.timestamp > loan.dueDates[3]);
-    }
-
     function liquidate(uint256 loanId) external {
-        require(checkLiquidatable(loanId), "Not liquidatable");
         Loan storage loan = loans[loanId];
+        require(loan.status == LoanStatus.Active, "Not active");
+        require(block.timestamp > loan.dueDates[3], "Not overdue");
+        
         loan.status = LoanStatus.Defaulted;
         scoreManager.updateScore(loan.borrower, -50, "Defaulted Loan");
-        uint256 outstanding = loan.principal - loan.repaid;
+        
+        euint64 outstanding = FHE.sub(loan.principal, loan.repaid);
         poolManager.slashLiquidity(loan.borrower, loan.poolToken, outstanding);
+        
+        userActiveDebt[loan.borrower] = FHE.sub(userActiveDebt[loan.borrower], loan.principal);
+        FHE.allow(userActiveDebt[loan.borrower], loan.borrower);
+        FHE.allowThis(userActiveDebt[loan.borrower]);
+        
         emit LoanDefaulted(loanId);
     }
 
-    function repay(uint256 loanId, uint256 amount) external {
+    function repay(uint256 loanId, externalEuint64 encryptedAmount, bytes calldata inputProof) external {
         Loan storage loan = loans[loanId];
         require(loan.borrower == msg.sender, "Only borrower");
+        euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
         _applyRepayment(loanId, amount);
     }
+
+    function getUserActiveDebt(address user) external view returns (euint64) {
+        return userActiveDebt[user];
+    }
 }
+

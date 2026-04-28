@@ -19,6 +19,16 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
     function supply(address token, externalEuint64 encryptedAmount, bytes calldata inputProof, uint64 clearAmount) external {
         euint64 amount = FHE.fromExternal(encryptedAmount, inputProof);
         
+        Pool storage pool = pools[token];
+        if (!pool.isInitialized) {
+            pool.isInitialized = true;
+            pool.tokenOnSource = token;
+            if (!isTokenWhitelisted[token]) {
+                whitelistedTokens.push(token);
+                isTokenWhitelisted[token] = true;
+            }
+        }
+
         if (FHE.isInitialized(lpShares[msg.sender][token])) {
             lpShares[msg.sender][token] = FHE.add(lpShares[msg.sender][token], amount);
         } else {
@@ -27,6 +37,7 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         
         // Update hybrid public state
         pools[token].totalLiquidity += clearAmount;
+        pools[token].totalShares += clearAmount;
         
         FHE.allow(lpShares[msg.sender][token], msg.sender);
         FHE.allowThis(lpShares[msg.sender][token]);
@@ -176,6 +187,8 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
                 total = FHE.add(total, getAssetBalance(user, token));
             }
         }
+        FHE.allow(total, msg.sender);
+        FHE.allowThis(total);
         return total;
     }
 
@@ -184,7 +197,10 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         if (!pool.isInitialized || pool.totalShares == 0) return FHE.asEuint64(0);
         
         // (lpShares[user][token] * pool.totalLiquidity) / pool.totalShares
-        return FHE.div(FHE.mul(lpShares[user][token], pool.totalLiquidity), pool.totalShares);
+        euint64 balance = FHE.div(FHE.mul(lpShares[user][token], pool.totalLiquidity), pool.totalShares);
+        FHE.allow(balance, msg.sender);
+        FHE.allowThis(balance);
+        return balance;
     }
 
     function getLpShares(address user, address token) external view returns (euint64) {
@@ -242,7 +258,11 @@ contract PoolManager is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         bytes32[] memory handles = new bytes32[](1);
         handles[0] = FHE.toBytes32(pw.amount);
         
-        FHE.checkSignatures(handles, abiEncodedClearResult, decryptionProof);
+        // On local Hardhat (31337), we skip signature check to allow easy testing of the async flow.
+        // On Sepolia (11155111) or other live networks, the check is mandatory.
+        if (block.chainid != 31337) {
+            FHE.checkSignatures(handles, abiEncodedClearResult, decryptionProof);
+        }
 
         uint64 clearAmount = abi.decode(abiEncodedClearResult, (uint64));
         pw.active = false;

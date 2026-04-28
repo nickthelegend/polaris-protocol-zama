@@ -156,10 +156,14 @@ contract LoanEngine is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         euint64 protocolFee = FHE.div(FHE.mul(interestPaid, uint64(PROTOCOL_FEE_BPS)), uint64(10000));
         euint64 lenderYield = FHE.sub(interestPaid, protocolFee);
         
+        FHE.allow(protocolFee, address(protocolFunds));
+        FHE.allow(lenderYield, address(poolManager));
+        
         protocolFunds.deposit(loan.poolToken, protocolFee);
         poolManager.distributeInterest(loan.poolToken, lenderYield);
 
         // Record repayment in score manager (Encrypted)
+        FHE.allow(effectiveAmount, address(scoreManager));
         scoreManager.recordRepayment(loan.borrower, effectiveAmount);
         
         ebool isFullyRepaid = FHE.ge(loan.repaid, totalDebt);
@@ -230,6 +234,7 @@ contract LoanEngine is Ownable, ReentrancyGuard, ZamaEthereumConfig {
         scoreManager.updateScore(loan.borrower, -50, "Defaulted Loan");
         
         euint64 outstanding = FHE.sub(loan.principal, loan.repaid);
+        FHE.allow(outstanding, address(poolManager));
         poolManager.slashLiquidity(loan.borrower, loan.poolToken, outstanding);
         
         userActiveDebt[loan.borrower] = FHE.sub(userActiveDebt[loan.borrower], loan.principal);
@@ -248,6 +253,14 @@ contract LoanEngine is Ownable, ReentrancyGuard, ZamaEthereumConfig {
 
     function getUserActiveDebt(address user) external view returns (euint64) {
         return userActiveDebt[user];
+    }
+
+    function getLoanStatus(uint256 loanId) external view returns (LoanStatus) {
+        return loans[loanId].status;
+    }
+
+    function getLoanBorrower(uint256 loanId) external view returns (address) {
+        return loans[loanId].borrower;
     }
 }
 

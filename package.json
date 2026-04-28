@@ -20,6 +20,7 @@
     "ethers": "^6.16.0",
     "fast-check": "^3.23.2",
     "fhevm": "^0.6.2",
+    "fhevmjs": "^0.6.2",
     "hardhat": "^2.28.3",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",

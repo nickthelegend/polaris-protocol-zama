@@ -58,8 +58,10 @@ contract ScoreManager is Ownable, ZamaEthereumConfig {
             newScore = FHE.select(canSub, FHE.sub(current, absDelta), FHE.asEuint32(uint32(MIN_SCORE)));
         }
 
+        FHE.allowThis(current);
         scores[user] = newScore;
         FHE.allow(newScore, user);
+        FHE.allow(newScore, msg.sender);
         FHE.allowThis(newScore);
         
         emit ScoreUpdated(user, 0, reason); // Score value is private
@@ -72,6 +74,7 @@ contract ScoreManager is Ownable, ZamaEthereumConfig {
             totalRepaidMap[user] = amount;
         }
         FHE.allow(totalRepaidMap[user], user);
+        FHE.allow(totalRepaidMap[user], msg.sender);
         FHE.allowThis(totalRepaidMap[user]);
         
         // Activity bonus: +5 points
@@ -106,7 +109,11 @@ contract ScoreManager is Ownable, ZamaEthereumConfig {
         
         // Multiplier: Score / 1000
         // (totalEffectiveCollateral * score) / 1000
-        return FHE.div(FHE.mul(totalEffectiveCollateral, FHE.asEuint64(score)), 1000);
+        euint64 limit = FHE.div(FHE.mul(totalEffectiveCollateral, FHE.asEuint64(score)), 1000);
+        FHE.allow(limit, user);
+        FHE.allow(limit, msg.sender); // Allow LoanEngine
+        FHE.allowThis(limit);
+        return limit;
     }
 }
 

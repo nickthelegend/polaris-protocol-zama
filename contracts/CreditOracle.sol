@@ -91,7 +91,13 @@ contract CreditOracle is Ownable, ZamaEthereumConfig {
     function getEncryptedNetValue(address user) external returns (euint64 netValue, ebool isPositive) {
         CreditProfile storage p = profiles[user];
         if (p.lastUpdate == 0 || p.lastUpdate < block.timestamp - 7 days) {
-            return (FHE.asEuint64(0), FHE.asEbool(true));
+            netValue = FHE.asEuint64(0);
+            isPositive = FHE.asEbool(true);
+            FHE.allow(netValue, msg.sender);
+            FHE.allow(isPositive, msg.sender);
+            FHE.allowThis(netValue);
+            FHE.allowThis(isPositive);
+            return (netValue, isPositive);
         }
         
         isPositive = FHE.ge(p.totalCollateralUsd, p.totalDebtUsd);
@@ -99,6 +105,11 @@ contract CreditOracle is Ownable, ZamaEthereumConfig {
             FHE.sub(p.totalCollateralUsd, p.totalDebtUsd), 
             FHE.sub(p.totalDebtUsd, p.totalCollateralUsd)
         );
+        
+        FHE.allow(netValue, msg.sender);
+        FHE.allow(isPositive, msg.sender);
+        FHE.allowThis(netValue);
+        FHE.allowThis(isPositive);
     }
 
     /**
